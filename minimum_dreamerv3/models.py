@@ -1,6 +1,7 @@
 import copy
 import torch
 from torch import nn
+from mamba import WrapMamba
 
 import networks
 import tools
@@ -35,7 +36,7 @@ class WorldModel(nn.Module):
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
         self.encoder = networks.MultiEncoder(shapes, **config.encoder) # CNNによる画像の特徴量抽出
         self.embed_size = self.encoder.outdim # 特徴量の次元数
-        self.dynamics = networks.RSSM( # 状態空間モデルのインスタンス化
+        self.dynamics = WrapMamba(
             config.dyn_stoch,
             config.dyn_deter,
             config.dyn_hidden,
@@ -52,6 +53,23 @@ class WorldModel(nn.Module):
             self.embed_size,
             config.device,
         )
+        # self.dynamics = networks.RSSM( # 状態空間モデルのインスタンス化
+        #     config.dyn_stoch,
+        #     config.dyn_deter,
+        #     config.dyn_hidden,
+        #     config.dyn_rec_depth,
+        #     config.dyn_discrete,
+        #     config.act,
+        #     config.norm,
+        #     config.dyn_mean_act,
+        #     config.dyn_std_act,
+        #     config.dyn_min_std,
+        #     config.unimix_ratio,
+        #     config.initial,
+        #     config.num_actions,
+        #     self.embed_size,
+        #     config.device,
+        # )
         self.heads = nn.ModuleDict()
         if config.dyn_discrete: # DreamerV3では確率的状態の潜在表現を離散化する
             feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
