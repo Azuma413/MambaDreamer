@@ -62,13 +62,20 @@ class WrapMamba(nn.Module):
         self._unimix_ratio = unimix_ratio
         
         # RSSMの代用としてのMamba
-        self.args = ModelArgs()
-        self.args.d_model = 384
-        self.args.n_layer = 4
-        self.args.vocab_size = stoch*discrete + deter + num_actions
-        self.args.feat_size = stoch*discrete + deter
+        self.args = ModelArgs(
+            d_model=32, # 96だとメモリ不足になった
+            n_layer=1, # 3だとメモリ不足になった 17179869184 17179869184.
+            vocab_size=stoch*discrete + deter + num_actions,
+            feat_size=stoch*discrete + deter,
+            )
+        
+        # print("vocab_size: ", stoch*discrete + deter + num_actions)
+        # print("feat_size: ", stoch*discrete + deter)
+        
         self.mamba = Mamba(self.args)
         self.mamba.apply(tools.weight_init)
+        
+        self.layer_norm = nn.LayerNorm(self.args.feat_size, eps=1e-03).to(self._device)
         
         # Mambaの出力とembedを結合してfeat_sizeの出力を得るFC層
         obs_out_layers = []
@@ -94,7 +101,7 @@ class WrapMamba(nn.Module):
         if self._initial == "zeros":
             return state
         elif self._initial == "learned":
-            print("learned initial state には対応していない")
+            # print("learned initial state には対応していない")
             return state
         else:
             raise NotImplementedError(self._initial)
@@ -147,7 +154,12 @@ class WrapMamba(nn.Module):
                 )
                 prev_state[key] = (val * (1.0 - is_first_r) + init_state[key] * is_first_r)
 
+        # ここの出力形状が思っていたのと違う
         prior = self.img_step(prev_state, prev_action) # 1ステップ先の状態表現を得る
+        
+        # print("img_obs:", prior["stoch"].shape)
+        # print("embed:", embed.shape)
+        
         x = torch.cat([prior["deter"], embed], -1) # rnn_hidden(deter)を1ステップ先のCNNの出力の画像の特徴量と結合
         # (batch_size, prior_deter + embed) -> (batch_size, hidden)
         next_img_obs = self._obs_out_layers(x) # xを全結合層に通してfeat_sizeの出力を得る
@@ -162,8 +174,10 @@ class WrapMamba(nn.Module):
         """
         prev_img_obs = prev_state["stoch"]
         x = torch.cat([prev_img_obs, prev_action], -1) # 前の潜在表現と前の行動を結合
+        # x = x.long()
+        # print("mamba input shape: ", x.shape)
         stats = self.mamba(x) # Mambaにより1ステップ先の未来の状態表現を得る
-        stats = nn.LayerNorm(self.args.feat_size, eps=1e-03)(stats) # statsを正規化
+        stats = self.layer_norm(stats) # statsを正規化
         prior = {"stoch": stats, "deter": stats, "logit": stats} # 状態遷移を用いた1ステップ先の未来の状態表現である"prior"を得る
         return prior
     
@@ -184,7 +198,7 @@ class WrapMamba(nn.Module):
         return state["stoch"]
     
     def get_dist(self, state, dtype=None):
-        return nn.Softmax(dim=-1)(state["stoch"])
+        return torch.distributions.Categorical(nn.Softmax(dim=-1)(state["stoch"]))
     
     def kl_loss(self, post, prior, free, dyn_scale, rep_scale):
         """
@@ -195,12 +209,18 @@ class WrapMamba(nn.Module):
         # softmaxで確率分布に変換
         post_value = nn.Softmax(dim=-1)(post["stoch"])
         prior_value = nn.Softmax(dim=-1)(prior["stoch"])
+        post_value_detached = post_value.detach()
+        prior_value_detached = prior_value.detach()
+        post_value = torch.distributions.Categorical(probs=post_value)
+        prior_value = torch.distributions.Categorical(probs=prior_value)
+        post_value_detached = torch.distributions.Categorical(probs=post_value_detached)
+        prior_value_detached = torch.distributions.Categorical(probs=prior_value_detached)
         rep_loss = value = kld(
             post_value,
-            prior_value.detach(),
+            prior_value_detached,
         )
         dyn_loss = kld(
-            post_value.detach(),
+            post_value_detached,
             prior_value,
         )
         rep_loss = torch.clip(rep_loss, min=free) # rep_lossの値がfree以下の場合はfreeにする free bitsの実装。論文ではfree=1
@@ -227,10 +247,10 @@ class ModelArgs:
         
         if self.dt_rank == 'auto':
             self.dt_rank = math.ceil(self.d_model / 16)
-            
-        if self.vocab_size % self.pad_vocab_size_multiple != 0:
-            self.vocab_size += (self.pad_vocab_size_multiple
-                                - self.vocab_size % self.pad_vocab_size_multiple)
+        # いったんコメントアウト
+        # if self.vocab_size % self.pad_vocab_size_multiple != 0:
+        #     self.vocab_size += (self.pad_vocab_size_multiple
+        #                         - self.vocab_size % self.pad_vocab_size_multiple)
 
 
 class Mamba(nn.Module):
@@ -238,40 +258,47 @@ class Mamba(nn.Module):
         """Full Mamba model."""
         super().__init__()
         self.args = args
-        # 単語の埋め込み層 vocab_size: 単語の数, d_model: 埋め込みベクトルの次元数 vocab_size -> d_model
-        # self.embedding = nn.Embedding(args.vocab_size, args.d_model)
-        self.fc_layer = nn.Linear(args.vocab_size, args.d_model) # vocab_sizeはaction + img_obs, d_modelは隠れ層の次元数 vmambaでは96, 192, 384, 768とか。この程度のサイズならok 
+
+        fc_layers = []
+        fc_layers.append(nn.Linear(args.vocab_size, args.d_model**2))
+        fc_layers.append(nn.LayerNorm(args.d_model**2, eps=1e-03))
+        fc_layers.append(nn.SiLU())
+        self.fc_layers = nn.Sequential(*fc_layers)
+        self.fc_layers.apply(tools.weight_init)
+        
         # n_layer分の残差ブロック層
         self.layers = nn.ModuleList([ResidualBlock(args) for _ in range(args.n_layer)])
         # 正規化層 d_model -> d_model
         self.norm_f = RMSNorm(args.d_model)
-        # 言語モデルの出力層 d_model -> vocab_size
-        self.lm_head = nn.Linear(args.d_model, args.feat_size, bias=False) # d_modelからimg_obsに変換する
-        # self.lm_head.weight = self.embedding.weight  # Tie output projection to embedding weights. これ必要なの？
-                                                     # See "Weight Tying" paper
+        
+        head_layer = []
+        head_layer.append(nn.Flatten(1))
+        head_layer.append(nn.Linear(args.d_model**2, args.feat_size, bias=False))
+        head_layer.append(nn.LayerNorm(args.feat_size, eps=1e-03))
+        self._head_layer = nn.Sequential(*head_layer)
+        self._head_layer.apply(tools.weight_init)
+
 
 
     def forward(self, input_ids):
-        """
-        Args:
-            input_ids (long tensor): shape (b, l)    (See Glossary at top for definitions of b, l, d_in, n...)
-    
-        Returns:
-            logits: shape (b, l, vocab_size)
-
-        Official Implementation:
-            class MambaLMHeadModel, https://github.com/state-spaces/mamba/blob/main/mamba_ssm/models/mixer_seq_simple.py#L173
-
-        """
-        # x = self.embedding(input_ids)
-        x = self.fc_layer(input_ids)
+        # print("input_ids shape: ", input_ids.shape) # [4, 1542]
+        x = self.fc_layers(input_ids) # vocab_size(feat_size + action_size) -> d_model*d_model
+        # print("output shape: ", x.shape) # [4, 4096]
         
+        # [b, d_model*d_model] -> [b, d_model, d_model]に変換
+        x = rearrange(x, 'b (d1 d2) -> b d1 d2', d1=self.args.d_model, d2=self.args.d_model)
+        # print("output shape1: ", x.shape)
+        
+        # 残差ブロック層をn_layer分通す
         for layer in self.layers:
             x = layer(x)
-            
+        
+        # print("output shape2: ", x.shape) # [4, 1542, 384]
         x = self.norm_f(x)
-        logits = self.lm_head(x)
+        
+        logits = self._head_layer(x)
 
+        # print("mamba return shape", logits.shape) # [4, 1542, 1536]
         return logits
 
     

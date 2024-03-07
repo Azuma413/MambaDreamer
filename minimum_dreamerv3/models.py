@@ -139,9 +139,14 @@ class WorldModel(nn.Module):
         with tools.RequiresGrad(self): # パラメータの勾配計算を有効にする
             with torch.cuda.amp.autocast(self._use_amp): # データ型を調整する
                 embed = self.encoder(data) # 画像の特徴量を抽出
+                # print("embed shape", embed.shape)
+                # print("action shape", data["action"].shape)
+                # print("is_first shape", data["is_first"].shape)
                 # RSSMによる状態空間モデルのlossを計算
                 # 出力: 現在の状態から予測された次の潜在状態表現, 次の状態から予測された次の潜在状態表現
                 post, prior = self.dynamics.observe(embed, data["action"], data["is_first"]) # 潜在状態の取得 入力: 特徴量，行動，初期状態かどうか
+                # print("post shape", post["stoch"].shape)
+                # print("prior shape", prior["stoch"].shape)
                 kl_free = self._config.kl_free # DreamerV3で実装されたFree Bitsの設定。KLが1以下なら1を返し，それ以外なら元の値を返す。
                 dyn_scale = self._config.dyn_scale # 環境変動予測器の出力を符号化器の出力に近づける項の重み
                 rep_scale = self._config.rep_scale # 環境変動予測器の出力を符号化器の出力から遠ざける項の重み dyn_scale > rep_scale, dyn_scale + rep_scale = 1
@@ -186,6 +191,8 @@ class WorldModel(nn.Module):
                 kl=kl_value,
                 postent=self.dynamics.get_dist(post).entropy(),
             )
+        
+        # context = {}
         post = {k: v.detach() for k, v in post.items()}
         return post, context, metrics
 

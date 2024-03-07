@@ -353,8 +353,8 @@ class MultiEncoder(nn.Module):
             for k, v in shapes.items()
             if len(v) in (1, 2) and re.match(mlp_keys, k)
         }
-        print("Encoder CNN shapes:", self.cnn_shapes)
-        print("Encoder MLP shapes:", self.mlp_shapes)
+        # print("Encoder CNN shapes:", self.cnn_shapes)
+        # print("Encoder MLP shapes:", self.mlp_shapes)
 
         self.outdim = 0
         if self.cnn_shapes:
@@ -381,12 +381,16 @@ class MultiEncoder(nn.Module):
     def forward(self, obs):
         outputs = []
         if self.cnn_shapes:
+            # print("image shape: ", self.cnn_shapes)
             inputs = torch.cat([obs[k] for k in self.cnn_shapes], -1)
+            # print("cnn inputs shape: ", inputs.shape)
             outputs.append(self._cnn(inputs))
+            # print("cnn outputs shape: ", outputs[-1].shape)
         if self.mlp_shapes:
             inputs = torch.cat([obs[k] for k in self.mlp_shapes], -1)
             outputs.append(self._mlp(inputs))
         outputs = torch.cat(outputs, -1)
+        # print("multi encorder return shape: ", outputs.shape)
         return outputs
 
 
